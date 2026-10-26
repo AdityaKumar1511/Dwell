@@ -147,3 +147,7 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Generated pdf.js worker + fonts/cmaps/wasm (see scripts/copy-pdf-worker.mjs)
+/public/pdf.worker.min.mjs
+/public/pdf/

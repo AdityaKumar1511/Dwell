@@ -4,6 +4,7 @@ import { UploadDropzone } from "@/components/upload-dropzone";
 import { requireUser } from "@/lib/auth";
 import { formatCount } from "@/lib/format";
 import { createClient } from "@/lib/supabase/server";
+import type { DashboardDocument } from "@/types/dashboard";
 
 export const metadata: Metadata = {
   title: "Dashboard",
@@ -15,11 +16,31 @@ export default async function DashboardPage() {
 
   const { data, error } = await supabase
     .from("documents")
-    .select("id, title, page_count, size_bytes, created_at")
-    .order("created_at", { ascending: false });
+    .select(
+      "id, title, page_count, size_bytes, created_at, links ( id, slug, recipient_name, recipient_email, created_at, revoked, expires_at )",
+    )
+    .order("created_at", { ascending: false })
+    .order("created_at", { ascending: false, referencedTable: "links" });
 
-  const documents = data ?? [];
-  const totalPages = documents.reduce((sum, document) => sum + document.page_count, 0);
+  const documents: DashboardDocument[] = (data ?? []).map((row) => ({
+    id: row.id,
+    title: row.title,
+    pageCount: row.page_count,
+    sizeBytes: row.size_bytes,
+    createdAt: row.created_at,
+    links: (row.links ?? []).map((link) => ({
+      id: link.id,
+      slug: link.slug,
+      recipientName: link.recipient_name,
+      recipientEmail: link.recipient_email,
+      createdAt: link.created_at,
+      revoked: link.revoked,
+      expiresAt: link.expires_at,
+    })),
+  }));
+
+  const totalPages = documents.reduce((sum, document) => sum + document.pageCount, 0);
+  const totalLinks = documents.reduce((sum, document) => sum + document.links.length, 0);
 
   return (
     <main className="mx-auto w-full max-w-5xl px-6 pb-20 pt-12">
@@ -49,9 +70,9 @@ export default async function DashboardPage() {
             {documents.length === 0
               ? "Empty"
               : `${formatCount(documents.length, "document")} · ${formatCount(
-                  totalPages,
-                  "page",
-                )} stored`}
+                  totalLinks,
+                  "link",
+                )} · ${formatCount(totalPages, "page")} stored`}
           </p>
         </div>
 

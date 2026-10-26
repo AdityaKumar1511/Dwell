@@ -7,9 +7,10 @@ export async function proxy(request: NextRequest) {
 
 export const config = {
   matcher: [
-    // Everything except static assets, files with an extension, and /api.
-    // API routes (e.g. the tracking beacon) authenticate themselves; bouncing a
-    // sendBeacon to /login would burn a session refresh per event.
-    "/((?!api|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|avif|ico|txt|xml)$).*)",
+    // Everything except static assets, files with an extension, /api, the
+    // public viewer, and the pdf.js assets. The tracking beacon and /v/[slug]
+    // authenticate themselves; bouncing either through the session refresh
+    // would be wrong (and slow). The viewer's cmaps/fonts/wasm live under /pdf/.
+    "/((?!api|v/|pdf/|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|avif|ico|txt|xml|js|mjs|css|map|woff2?|wasm|bcmap|pfb|ttf|otf)$).*)",
   ],
 };
