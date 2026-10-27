@@ -148,9 +148,11 @@ export type Database = {
           id: number;
           view_id: string;
           link_id: string;
+          client_event_id: string | null;
           event_type: Database["public"]["Enums"]["event_type"];
           page: number | null;
           duration_ms: number | null;
+          scroll_depth: number | null;
           meta: Json;
           created_at: string;
         };
@@ -160,16 +162,20 @@ export type Database = {
           // Derived from views.link_id by a trigger. Never send it — an
           // inconsistent value would be silently overwritten anyway.
           link_id?: string;
+          client_event_id?: string | null;
           event_type: Database["public"]["Enums"]["event_type"];
           page?: number | null;
           duration_ms?: number | null;
+          scroll_depth?: number | null;
           meta?: Json;
           created_at?: string;
         };
         Update: {
+          client_event_id?: string | null;
           event_type?: Database["public"]["Enums"]["event_type"];
           page?: number | null;
           duration_ms?: number | null;
+          scroll_depth?: number | null;
           meta?: Json;
         };
         Relationships: [

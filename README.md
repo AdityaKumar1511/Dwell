@@ -2,8 +2,9 @@
 
 Read receipts for your resume, proposals, and portfolio. Per-page analytics with a live dashboard.
 
-**Phase 2 (current):** scaffold, schema + RLS, email-link auth, PDF upload, document library,
-per-recipient links, and the public reader at `/v/[slug]`.
+**Phase 3 (current):** scaffold, schema + RLS, email-link auth, PDF upload,
+document library, per-recipient links, the public reader at `/v/[slug]`, and
+engagement tracking.
 
 ## Stack
 
@@ -21,8 +22,9 @@ Copy the project URL and keys from **Project Settings → API**.
 
 ### 2. Apply the migration
 
-Open the Supabase **SQL Editor** and run the contents of
-[`supabase/migrations/0001_init.sql`](supabase/migrations/0001_init.sql).
+Open the Supabase **SQL Editor** and run, in order,
+[`supabase/migrations/0001_init.sql`](supabase/migrations/0001_init.sql) and
+[`supabase/migrations/0002_tracking.sql`](supabase/migrations/0002_tracking.sql).
 
 Or, with the Supabase CLI linked to the project:
 
@@ -32,7 +34,9 @@ supabase db push
 ```
 
 This creates the four tables, RLS policies, indexes, the private `documents`
-Storage bucket, and the Storage policies.
+Storage bucket, and the Storage policies. `0002_tracking.sql` adds
+`events.client_event_id`, `events.scroll_depth`, and the unique
+`(view_id, client_event_id)` index that makes tracking retries idempotent.
 
 ### 3. Configure auth
 
@@ -113,10 +117,40 @@ recipient ──GET /v/<slug>──▶ validate + sign the PDF (1 h, service rol
 - Device / browser / OS come from a coarse UA parse (`bowser`); country and city
   from Vercel's geo headers; the referrer is stored as origin + path only. No IP
   and no raw UA string are stored.
-- PDF.js renders lazily: only pages within ~1500 px of the viewport keep a
-  bitmap, and each page wrapper carries `data-page="N"` for Phase 3's page
-  timeline.
 - The reader is told plainly: *This link records views and engagement.*
+- PDF.js renders lazily: only pages within ~1500 px of the viewport keep a
+  bitmap, and each page wrapper carries `data-page="N"` for page detection.
+
+## How tracking works
+
+`components/viewer/use-engagement.ts` runs only after `/api/view` returns a
+`viewId`; before that the reader sees the document but nothing is recorded.
+
+- **Current page** is the most visible `[data-page]` element, chosen with an
+  `IntersectionObserver` and a 150 ms settle window (10% minimum visibility; a
+  new page must lead by 2 points). Page changes emit `page_enter` (with
+  `duration_ms: 0`) and `page_leave` (with the active time and max depth).
+- **Active time** ticks once per second only while the tab is visible *and* the
+  window is focused or received input in the last 30 s. Hiding the tab pauses;
+  `tab_hidden` / `tab_visible` are emitted and the queue is flushed with
+  `navigator.sendBeacon`.
+- **Scroll depth** is the furthest percentage of the current page that entered
+  the viewport, kept in memory per page and sent with `page_leave`.
+- **Interactions** are recorded without ever blocking them: link clicks
+  (`click`, or `download` for `download` attributes / file extensions), print
+  (`beforeprint`), copy, and Ctrl/Cmd+S.
+- **Delivery** batches events in memory (flushed every 5 s and whenever 40 are
+  queued), sends a final `page_leave` + `close` on `pagehide` with beacons, and
+  drops the oldest events if the queue exceeds 200. Each event carries a
+  client-generated UUID so retries are idempotent.
+- **`POST /api/track`** accepts ≤ 24 KB and ≤ 40 events per request, whitelists
+  the nine event types, clamps pages, durations (30 min) and depth (0–100),
+  sanitizes click URLs to origin + path, rejects views whose link is revoked or
+  expired, and allows 300 stored events per view per minute. It never reads or
+  writes IP addresses. Events are inserted with the service role and
+  `views.last_seen_at` is touched at the same time.
+
+There is no dashboard yet; the recorded data is ready for Phase 4/5.
 
 ### pdf.js assets
 
@@ -138,7 +172,7 @@ recipient ──GET /v/<slug>──▶ validate + sign the PDF (1 h, service rol
   session can insert fake engagement.
 - **`links.password_hash`** has no `SELECT` privilege for `anon` or
   `authenticated`, even for the owner. PostgREST queries that `select("*")` from
-  `links` will fail by design. Phase 3 moves the hash into a deny-all
+  `links` will fail by design. A later phase moves the hash into a deny-all
   `link_secrets` table read only by the service role.
 - **Storage** is private; objects are namespaced by owner id and gated by Storage
   RLS policies.
@@ -189,14 +223,20 @@ npm run typecheck  # tsc --noEmit
 `postinstall` copies the pdf.js worker, cmaps, standard fonts, and wasm decoders
 into `public/` (gitignored) so the viewer can render offline from the app origin.
 
-## Known gaps (Phase 2)
+## Known gaps (Phase 3)
 
 - No rate limit on `POST /api/view` beyond slug entropy. Add a per-IP limit
   before a public launch.
 - Copy uses `navigator.clipboard` with an `execCommand` fallback; on a denied
   permission the button reports “Copy failed” and the slug is still visible.
 - The signed URL lasts one hour; a very long read reloads the PDF URL from a
-  fresh page load only. Phase 3 can refresh it in place.
+  fresh page load only.
+- `POST /api/track`'s limit is database-backed (300 stored events per view per
+  minute) rather than a distributed token bucket. Behind a botnet it only caps
+  the damage per view, not the total request rate.
+- Restoring a page from the back/forward cache after `pagehide` resumes timers
+  without a second `page_enter`; the next page change or unload still records
+  consistently.
 
 ## Data model
 
@@ -204,7 +244,8 @@ into `public/` (gitignored) so the viewer can render offline from the app origin
 - `links` — one per recipient; slug, optional password/expiry/max views/revoke
 - `views` — one per reading session, with device/browser/os/geo/referrer
 - `events` — `open`, `page_enter`, `page_leave`, `scroll`, `click`, `download`,
-  `print`, `copy`, `tab_hidden`, `tab_visible`, `close`
+  `print`, `copy`, `tab_hidden`, `tab_visible`, `close`; `client_event_id` and
+  `scroll_depth` arrive with `0002_tracking.sql`
 
 `events.link_id` is denormalised for dashboard queries and derived from
 `views.link_id` by a trigger, so the two can never disagree.

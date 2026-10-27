@@ -2,11 +2,16 @@
 
 import { useEffect, useRef, useState } from "react";
 import type {
+  AnnotationLayer,
   PDFDocumentLoadingTask,
   PDFDocumentProxy,
   PDFPageProxy,
+  TextLayer,
 } from "pdfjs-dist";
+import type { PDFLinkService } from "pdfjs-dist/web/pdf_viewer.mjs";
 import { cn } from "@/lib/cn";
+import { parseClickableUrl } from "@/lib/tracking";
+import "./pdf-layers.css";
 
 const DEFAULT_RATIO = 612 / 792; // US Letter, width / height
 const DPR_CAP = 2;
@@ -15,20 +20,64 @@ const WORKER_URL = "/pdf.worker.min.mjs";
 
 type RenderTask = ReturnType<PDFPageProxy["render"]>;
 
+type LinkService = {
+  addLinkAttributes(
+    link: HTMLAnchorElement,
+    url: string,
+    newWindow?: boolean,
+  ): void;
+  getDestinationHash(destination: unknown): string;
+  getAnchorUrl(hash: string): string;
+  goToDestination(destination: unknown): Promise<void>;
+  executeNamedAction(action: unknown): void;
+  executeSetOCGState(state: unknown): void;
+  getAttachmentContent(id: string): Promise<null>;
+  eventBus: null;
+};
+
+/**
+ * Minimal `PDFLinkService` for link annotations. The real service pulls in the
+ * whole PDF.js viewer UI; we only need external URLs and mail/phone links.
+ */
+const linkService: LinkService = {
+  addLinkAttributes(link, url) {
+    const target = parseClickableUrl(url);
+    if (!target) return;
+
+    link.href = target.href;
+
+    if (target.protocol === "mailto:" || target.protocol === "tel:") {
+      link.removeAttribute("target");
+      link.removeAttribute("rel");
+      return;
+    }
+
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+  },
+  getDestinationHash: () => "#",
+  getAnchorUrl: () => "#",
+  goToDestination: async () => {},
+  executeNamedAction: () => {},
+  executeSetOCGState: () => {},
+  getAttachmentContent: async () => null,
+  eventBus: null,
+};
+
 export function PdfPages({
   url,
-  onPageChange,
   onPageCount,
+  onPagesReady,
 }: {
   url: string;
-  onPageChange?: (page: number) => void;
   onPageCount?: (count: number) => void;
+  /** Fires once the page elements are in the tree and observable. */
+  onPagesReady?: () => void;
 }) {
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [progress, setProgress] = useState<number | null>(null);
   const [ratio, setRatio] = useState(DEFAULT_RATIO);
   const [failed, setFailed] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let disposed = false;
@@ -63,6 +112,7 @@ export function PdfPages({
         setPdf(document);
         setProgress(100);
         onPageCount?.(document.numPages);
+        onPagesReady?.();
       } catch (error) {
         if (!disposed) {
           console.error("dwell: pdf load failed", error);
@@ -75,32 +125,7 @@ export function PdfPages({
       disposed = true;
       void loadingTask?.destroy();
     };
-  }, [url, onPageCount]);
-
-  // Which page occupies the middle of the viewport.
-  useEffect(() => {
-    const root = containerRef.current;
-    if (!pdf || !root) return;
-
-    const pages = root.querySelectorAll<HTMLElement>("[data-page]");
-    if (pages.length === 0) return;
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const topmost = entries
-          .filter((entry) => entry.isIntersecting)
-          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0];
-
-        if (!topmost) return;
-        const page = Number((topmost.target as HTMLElement).dataset.page);
-        if (Number.isFinite(page) && page > 0) onPageChange?.(page);
-      },
-      { rootMargin: "-45% 0px -45% 0px" },
-    );
-
-    pages.forEach((page) => observer.observe(page));
-    return () => observer.disconnect();
-  }, [pdf, onPageChange]);
+  }, [url, onPageCount, onPagesReady]);
 
   if (failed) {
     return (
@@ -128,7 +153,6 @@ export function PdfPages({
 
   return (
     <div
-      ref={containerRef}
       className="mx-auto w-full max-w-[900px] px-3 sm:px-6"
       aria-busy={!pdf}
     >
@@ -162,6 +186,8 @@ function PdfPage({
 }) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const textLayerRef = useRef<HTMLDivElement>(null);
+  const annotationLayerRef = useRef<HTMLDivElement>(null);
   const [near, setNear] = useState(false);
   const [width, setWidth] = useState(0);
   const [ratio, setRatio] = useState(defaultRatio);
@@ -202,10 +228,18 @@ function PdfPage({
   useEffect(() => {
     if (!near || width === 0) return;
 
+    const host = wrapperRef.current;
+    const textDiv = textLayerRef.current;
+    const annotationDiv = annotationLayerRef.current;
+    if (!host || !textDiv || !annotationDiv) return;
+
     let cancelled = false;
     let task: RenderTask | null = null;
+    let textLayer: TextLayer | null = null;
+    let annotationLayer: AnnotationLayer | null = null;
 
     (async () => {
+      const pdfjs = await import("pdfjs-dist");
       const page = await pdf.getPage(pageNumber);
       if (cancelled) return;
 
@@ -234,6 +268,105 @@ function PdfPage({
       if (cancelled) return;
       setRatio(base.width / base.height);
       setPainted(true);
+
+      // PDF.js lays these layers out in CSS pixels. The canvas backing store
+      // is what DPR scales, so the layer factor must not include the DPR.
+      host.style.setProperty(
+        "--total-scale-factor",
+        String(viewport.scale),
+      );
+
+      try {
+        const textContent = await page.getTextContent();
+        if (cancelled) return;
+        const layer = new pdfjs.TextLayer({
+          textContentSource: textContent,
+          container: textDiv,
+          viewport,
+        });
+        textLayer = layer;
+        await layer.render();
+        if (cancelled) {
+          textDiv.replaceChildren();
+          textLayer = null;
+        }
+      } catch (error) {
+        if (!cancelled) console.warn("dwell: text layer failed", error);
+        textLayer = null;
+        textDiv.replaceChildren();
+      }
+
+      if (cancelled) return;
+
+      try {
+        const annotations = await page.getAnnotations({ intent: "display" });
+        if (cancelled) return;
+
+        const links = annotations.filter(
+          (annotation) =>
+            annotation.annotationType === pdfjs.AnnotationType.LINK &&
+            typeof annotation.url === "string" &&
+            parseClickableUrl(annotation.url) !== null,
+        );
+
+        if (links.length === 0) {
+          annotationDiv.replaceChildren();
+          return;
+        }
+
+        annotationLayer = new pdfjs.AnnotationLayer({
+          div: annotationDiv,
+          page,
+          viewport,
+          linkService,
+          accessibilityManager: null,
+          annotationCanvasMap: null,
+          annotationEditorUIManager: null,
+          structTreeLayer: null,
+          commentManager: null,
+          annotationStorage: null,
+        });
+        const layer = annotationLayer;
+        await layer.render({
+          annotations: links,
+          viewport,
+          div: annotationDiv,
+          page,
+          linkService: linkService as unknown as PDFLinkService,
+          renderForms: false,
+        });
+        if (cancelled) {
+          layer.destroy();
+          annotationLayer = null;
+          annotationDiv.replaceChildren();
+          return;
+        }
+
+        // Defense in depth: only web links open a new tab. Mail and phone links
+        // keep browser-default behavior; anything else is made inert.
+        for (const anchor of annotationDiv.querySelectorAll<HTMLAnchorElement>(
+          "a[href]",
+        )) {
+          const target = parseClickableUrl(anchor.href);
+          if (!target) {
+            anchor.removeAttribute("href");
+          } else if (
+            target.protocol === "mailto:" ||
+            target.protocol === "tel:"
+          ) {
+            anchor.removeAttribute("target");
+            anchor.removeAttribute("rel");
+          } else {
+            anchor.target = "_blank";
+            anchor.rel = "noopener noreferrer";
+          }
+        }
+      } catch (error) {
+        if (!cancelled) console.warn("dwell: annotation layer failed", error);
+        annotationLayer?.destroy();
+        annotationLayer = null;
+        annotationDiv.replaceChildren();
+      }
     })().catch(() => {
       // RenderingCancelledException is expected when a page scrolls away.
     });
@@ -241,6 +374,22 @@ function PdfPage({
     return () => {
       cancelled = true;
       task?.cancel();
+      if (textLayer) {
+        try {
+          textLayer.cancel();
+        } catch {
+          // Already cancelled.
+        }
+      }
+      textLayer = null;
+      try {
+        annotationLayer?.destroy();
+      } catch {
+        // Already destroyed.
+      }
+      annotationLayer = null;
+      textDiv.replaceChildren();
+      annotationDiv.replaceChildren();
     };
   }, [near, width, pdf, pageNumber]);
 
@@ -260,7 +409,7 @@ function PdfPage({
       data-page={pageNumber}
       role="img"
       aria-label={`Page ${pageNumber} of ${totalPages}`}
-      className="relative mb-4 w-full overflow-hidden rounded-[2px] bg-white ring-1 ring-black/20 shadow-[0_1px_0_rgba(255,255,255,0.06),0_30px_60px_-30px_rgba(0,0,0,0.95)] sm:mb-6"
+      className="pdfPage relative mb-4 w-full overflow-hidden rounded-[2px] bg-white ring-1 ring-black/20 shadow-[0_1px_0_rgba(255,255,255,0.06),0_30px_60px_-30px_rgba(0,0,0,0.95)] sm:mb-6"
       style={{ aspectRatio: ratio }}
     >
       <canvas
@@ -271,6 +420,8 @@ function PdfPage({
           painted ? "opacity-100" : "opacity-0",
         )}
       />
+      <div ref={textLayerRef} className="textLayer" />
+      <div ref={annotationLayerRef} className="annotationLayer" />
       {!painted ? (
         <span aria-hidden className="absolute inset-0 animate-pulse bg-white" />
       ) : null}

@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { PdfPages } from "@/components/pdf/pdf-pages";
 import { LiveDot } from "@/components/live-dot";
+import { useEngagementTracker } from "@/components/viewer/use-engagement";
 
 type ViewState = "pending" | "ready" | "blocked";
 
@@ -20,9 +21,18 @@ export function Viewer({
   signedUrl: string;
 }) {
   const [viewState, setViewState] = useState<ViewState>("pending");
-  const [page, setPage] = useState(1);
+  const [viewId, setViewId] = useState<string | null>(null);
+  const [pagesReady, setPagesReady] = useState(false);
   const [pageCount, setPageCount] = useState(initialPageCount);
+  const containerRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
+
+  const handlePagesReady = useCallback(() => setPagesReady(true), []);
+  const { currentPage } = useEngagementTracker({
+    viewId,
+    pagesReady,
+    containerRef,
+  });
 
   useEffect(() => {
     if (started.current) return;
@@ -46,22 +56,22 @@ export function Viewer({
         }
         const payload = (await response.json()) as { viewId?: unknown };
         if (typeof payload.viewId === "string") {
-          setViewState("ready");
+          setViewId(payload.viewId);
           try {
-            // Phase 3 reads this to attach events to the same session.
+            // Survives a reload of the same tab without minting a second view.
             sessionStorage.setItem(`dwell:view:${slug}`, payload.viewId);
           } catch {
             // Private mode: the id stays in memory only.
           }
-        } else {
-          setViewState("ready");
         }
+        setViewState("ready");
       })
       .catch(() => setViewState("ready"));
   }, [slug]);
 
   const pad = (value: number) => String(value).padStart(2, "0");
-  const progress = pageCount > 0 ? Math.min(100, (page / pageCount) * 100) : 0;
+  const progress =
+    pageCount > 0 ? Math.min(100, (currentPage / pageCount) * 100) : 0;
 
   return (
     <div className="relative z-10 min-h-dvh">
@@ -84,7 +94,8 @@ export function Viewer({
           </div>
 
           <p className="shrink-0 font-mono text-[10px] tabular-nums tracking-[0.08em] text-faint">
-            {pad(page)} <span className="text-line-2">/</span> {pad(pageCount)}
+            {pad(currentPage)} <span className="text-line-2">/</span>{" "}
+            {pad(pageCount)}
           </p>
         </div>
 
@@ -116,25 +127,27 @@ export function Viewer({
       </div>
 
       <main className="pb-16 pt-5 sm:pt-8">
-        {viewState === "blocked" ? (
-          <div className="mx-auto max-w-md px-6 py-28 text-center">
-            <p className="font-mono text-[10px] uppercase tracking-[0.24em] text-heat-3">
-              Link closed
-            </p>
-            <h1 className="mt-4 font-display text-4xl leading-tight text-chalk">
-              This link is no longer available.
-            </h1>
-            <p className="mt-3 text-sm leading-relaxed text-dim">
-              It may have reached its view limit. Ask the sender for a new one.
-            </p>
-          </div>
-        ) : (
-          <PdfPages
-            url={signedUrl}
-            onPageChange={setPage}
-            onPageCount={setPageCount}
-          />
-        )}
+        <div ref={containerRef}>
+          {viewState === "blocked" ? (
+            <div className="mx-auto max-w-md px-6 py-28 text-center">
+              <p className="font-mono text-[10px] uppercase tracking-[0.24em] text-heat-3">
+                Link closed
+              </p>
+              <h1 className="mt-4 font-display text-4xl leading-tight text-chalk">
+                This link is no longer available.
+              </h1>
+              <p className="mt-3 text-sm leading-relaxed text-dim">
+                It may have reached its view limit. Ask the sender for a new one.
+              </p>
+            </div>
+          ) : (
+            <PdfPages
+              url={signedUrl}
+              onPageCount={setPageCount}
+              onPagesReady={handlePagesReady}
+            />
+          )}
+        </div>
       </main>
 
       <footer className="mx-auto w-full max-w-3xl px-6 pb-12 text-center">
